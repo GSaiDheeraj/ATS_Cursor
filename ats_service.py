@@ -1,34 +1,67 @@
 import os
 import json
 import re
-from typing import Dict, List, Any
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import PorterStemmer
-import numpy as np
+from typing import Dict, List, Any, Optional
+from ats_ai_service import ATSAIService
+from config_ats import ATSConfig
 
-# Download required NLTK data
+# Keep some traditional NLP imports for fallback functionality
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize
+    from nltk.stem import PorterStemmer
+    import numpy as np
+    TRADITIONAL_NLP_AVAILABLE = True
+except ImportError:
+    TRADITIONAL_NLP_AVAILABLE = False
 
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
+# Download required NLTK data (only if traditional NLP is available)
+if TRADITIONAL_NLP_AVAILABLE:
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
+
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('stopwords')
 
 class ATSService:
     """
-    ATS (Applicant Tracking System) Service for comparing resumes with job descriptions
+    Enhanced ATS (Applicant Tracking System) Service using Gemini AI for intelligent resume analysis
+    Falls back to traditional NLP methods if AI service is unavailable
     """
     
-    def __init__(self):
-        self.stemmer = PorterStemmer()
-        self.stop_words = set(stopwords.words('english'))
+    def __init__(self, use_ai: bool = True, project_id: str = None, location: str = None):
+        self.config = ATSConfig()
+        self.use_ai = use_ai
+        
+        # Initialize AI service if requested and available
+        self.ai_service = None
+        if use_ai:
+            try:
+                print(f"[DEBUG] ATSService.__init__: Attempting to initialize AI service")
+                self.ai_service = ATSAIService(project_id, location)
+                print(f"[DEBUG] ATSService.__init__: AI service initialized successfully")
+            except Exception as e:
+                print(f"[ERROR] ATSService.__init__: Could not initialize AI service: {e}")
+                print(f"[ERROR] ATSService.__init__: Exception type: {type(e).__name__}")
+                import traceback
+                print(f"[ERROR] ATSService.__init__: Full traceback: {traceback.format_exc()}")
+                print("Falling back to traditional NLP methods")
+                self.use_ai = False
+        
+        # Initialize traditional NLP components for fallback
+        if TRADITIONAL_NLP_AVAILABLE:
+            self.stemmer = PorterStemmer()
+            self.stop_words = set(stopwords.words('english'))
+        else:
+            self.stemmer = None
+            self.stop_words = set()
         
         # Common ATS keywords categories
         self.skill_keywords = [
@@ -183,37 +216,76 @@ class ATSService:
 
     def generate_ats_score(self, resume_text: str, jd_text: str) -> Dict[str, Any]:
         """
-        Generate comprehensive ATS score and analysis
+        Generate comprehensive ATS score and analysis using AI or traditional methods
         """
-        # Calculate different components
+        # Try AI analysis first if available
+        if self.use_ai and self.ai_service:
+            try:
+                print(f"[DEBUG] generate_ats_score: Starting AI analysis")
+                print(f"[DEBUG] generate_ats_score: Resume length: {len(resume_text)}, JD length: {len(jd_text)}")
+                ai_result = self.ai_service.analyze_resume(resume_text, jd_text)
+                print(f"[DEBUG] generate_ats_score: AI analysis completed")
+                
+                # If AI analysis was successful, return it
+                if not ai_result.get('error', False):
+                    print(f"[DEBUG] generate_ats_score: AI analysis successful, adding contact info")
+                    # Add traditional contact info extraction as enhancement
+                    contact_info = self.extract_contact_info(resume_text)
+                    ai_result['contact_info'] = contact_info
+                    
+                    return ai_result
+                else:
+                    print(f"[ERROR] generate_ats_score: AI analysis failed: {ai_result.get('message', 'Unknown error')}")
+                    print("Falling back to traditional analysis")
+                    
+            except Exception as e:
+                print(f"[ERROR] generate_ats_score: AI analysis error: {e}")
+                print(f"[ERROR] generate_ats_score: Exception type: {type(e).__name__}")
+                import traceback
+                print(f"[ERROR] generate_ats_score: Full traceback: {traceback.format_exc()}")
+                print("Falling back to traditional analysis")
+        
+        # Fallback to traditional analysis
+        return self._generate_traditional_ats_score(resume_text, jd_text)
+
+    def _generate_traditional_ats_score(self, resume_text: str, jd_text: str) -> Dict[str, Any]:
+        """
+        Generate ATS score using traditional NLP methods (fallback)
+        """
+        if not TRADITIONAL_NLP_AVAILABLE:
+            return {
+                'error': True,
+                'message': 'Neither AI service nor traditional NLP libraries are available',
+                'overall_score': 0,
+                'compatibility_level': 'Error',
+                'status': 'Analysis unavailable - missing dependencies'
+            }
+        
+        # Calculate different components using traditional methods
         keyword_analysis = self.calculate_keyword_match_score(resume_text, jd_text)
         semantic_score = self.calculate_semantic_similarity(resume_text, jd_text)
         sections_analysis = self.analyze_sections(resume_text, jd_text)
         
-        # Calculate weighted overall score
-        keyword_weight = 0.4
-        semantic_weight = 0.3
-        skills_weight = 0.2
-        experience_weight = 0.1
-        
+        # Calculate weighted overall score using config weights
+        weights = self.config.ATS_SCORING_WEIGHTS
         overall_score = (
-            keyword_analysis['keyword_score'] * keyword_weight +
-            semantic_score * semantic_weight +
-            sections_analysis['skills']['score'] * skills_weight +
-            sections_analysis['experience']['score'] * experience_weight
+            keyword_analysis['keyword_score'] * weights.get('keyword_density', 0.4) +
+            semantic_score * weights.get('semantic_similarity', 0.3) +
+            sections_analysis['skills']['score'] * weights.get('skills_match', 0.2) +
+            sections_analysis['experience']['score'] * weights.get('experience_match', 0.1)
         )
         
         # Generate recommendations
         recommendations = self.generate_recommendations(keyword_analysis, sections_analysis)
         
-        # Determine ATS compatibility level
-        if overall_score >= 80:
+        # Determine ATS compatibility level using config thresholds
+        if overall_score >= self.config.EXCELLENT_SCORE_THRESHOLD:
             compatibility = "Excellent"
             status = "High chance of passing ATS screening"
-        elif overall_score >= 60:
+        elif overall_score >= self.config.GOOD_SCORE_THRESHOLD:
             compatibility = "Good"
             status = "Moderate chance of passing ATS screening"
-        elif overall_score >= 40:
+        elif overall_score >= self.config.FAIR_SCORE_THRESHOLD:
             compatibility = "Fair"
             status = "Low chance of passing ATS screening"
         else:
@@ -238,10 +310,12 @@ class ATSService:
             },
             'sections_breakdown': sections_analysis,
             'recommendations': recommendations,
+            'contact_info': self.extract_contact_info(resume_text),
             'metadata': {
                 'total_jd_keywords': keyword_analysis['total_jd_keywords'],
                 'matched_keywords_count': keyword_analysis['matched_count'],
-                'processing_timestamp': self.get_timestamp()
+                'processing_timestamp': self.get_timestamp(),
+                'analysis_method': 'traditional_nlp'
             }
         }
 
@@ -305,3 +379,86 @@ class ATSService:
         contact_info['linkedin'] = linkedin[0] if linkedin else None
         
         return contact_info
+
+    def batch_analyze_resumes(self, resumes_data: List[Dict[str, str]], job_description: str) -> List[Dict[str, Any]]:
+        """
+        Analyze multiple resumes against a single job description
+        Uses AI service if available, otherwise falls back to traditional analysis
+        """
+        if self.use_ai and self.ai_service:
+            try:
+                return self.ai_service.batch_analyze_resumes(resumes_data, job_description)
+            except Exception as e:
+                print(f"Batch AI analysis failed: {e}")
+                print("Falling back to individual traditional analysis")
+        
+        # Fallback to individual traditional analysis
+        results = []
+        for i, resume_data in enumerate(resumes_data):
+            try:
+                resume_text = resume_data.get('text', '')
+                resume_id = resume_data.get('id', f'resume_{i+1}')
+                
+                analysis = self.generate_ats_score(resume_text, job_description)
+                analysis['resume_id'] = resume_id
+                analysis['batch_position'] = i + 1
+                
+                results.append(analysis)
+                
+            except Exception as e:
+                error_result = {
+                    'error': True,
+                    'message': f"Traditional analysis error for resume {i+1}: {str(e)}",
+                    'overall_score': 0,
+                    'compatibility_level': "Error",
+                    'status': "Analysis failed due to technical error",
+                    'resume_id': resume_data.get('id', f'resume_{i+1}'),
+                    'batch_position': i + 1,
+                    'metadata': {
+                        'analysis_timestamp': self.get_timestamp(),
+                        'processing_method': 'error_handler'
+                    }
+                }
+                results.append(error_result)
+        
+        return results
+
+    def get_analysis_method(self) -> str:
+        """Get the current analysis method being used"""
+        if self.use_ai and self.ai_service:
+            return "gemini_ai"
+        elif TRADITIONAL_NLP_AVAILABLE:
+            return "traditional_nlp"
+        else:
+            return "unavailable"
+
+    def get_service_info(self) -> Dict[str, Any]:
+        """Get information about the current service configuration"""
+        info = {
+            'ai_enabled': self.use_ai,
+            'ai_available': self.ai_service is not None,
+            'traditional_nlp_available': TRADITIONAL_NLP_AVAILABLE,
+            'current_method': self.get_analysis_method()
+        }
+        
+        if self.ai_service:
+            info.update(self.ai_service.get_model_info())
+        
+        return info
+
+    def toggle_ai_usage(self, use_ai: bool = True, project_id: str = None, location: str = None) -> bool:
+        """
+        Toggle between AI and traditional analysis methods
+        Returns True if the toggle was successful
+        """
+        if use_ai and not self.ai_service:
+            try:
+                self.ai_service = ATSAIService(project_id, location)
+                self.use_ai = True
+                return True
+            except Exception as e:
+                print(f"Failed to initialize AI service: {e}")
+                return False
+        
+        self.use_ai = use_ai
+        return True
